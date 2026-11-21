@@ -1,0 +1,143 @@
+# Builds an installable Android APK of "Sunward Roads" from SunwardRoads.zip (put it in the repo root).
+# Optional: run manually and paste a direct download link to the zip into "game_url" instead.
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      game_url:
+        description: "Optional direct link to the game zip (leave empty to use SunwardRoads.zip from the repo)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  GODOT_VERSION: "4.7.2"
+  GODOT_CHANNEL: "stable"
+  ANDROID_BUILD_TOOLS: "35.0.1"
+  ANDROID_PLATFORM: "35"
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Get the game
+        id: proj
+        env:
+          GAME_URL: ${{ github.event.inputs.game_url }}
+        run: |
+          set -eu
+          if [ -n "${GAME_URL:-}" ]; then
+            curl -fsSL -o game.zip "$GAME_URL"
+          elif [ -f SunwardRoads.zip ]; then
+            cp SunwardRoads.zip game.zip
+          else
+            echo "::error::SunwardRoads.zip not found in the repo root (and no game_url given)"
+            exit 1
+          fi
+          mkdir -p game
+          unzip -q game.zip -d game
+          f=$(find game -name project.godot -not -path '*/.godot/*' | head -n1)
+          [ -n "$f" ] || { echo "::error::project.godot not found inside the zip"; exit 1; }
+          echo "dir=$(dirname "$f")" >> "$GITHUB_OUTPUT"
+
+      - name: Install Godot and export templates
+        run: |
+          set -euo pipefail
+          V="${GODOT_VERSION}-${GODOT_CHANNEL}"
+          BASE="https://github.com/godotengine/godot-builds/releases/download/${V}"
+          curl -fsSL -o godot.zip "${BASE}/Godot_v${V}_linux.x86_64.zip"
+          curl -fsSL -o templates.tpz "${BASE}/Godot_v${V}_export_templates.tpz"
+          unzip -q godot.zip
+          sudo mv "Godot_v${V}_linux.x86_64" /usr/local/bin/godot
+          sudo chmod +x /usr/local/bin/godot
+          T="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.${GODOT_CHANNEL}"
+          mkdir -p "$T" tpl
+          unzip -q templates.tpz -d tpl
+          mv tpl/templates/* "$T/"
+          godot --version
+
+      - name: Android SDK packages
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK=$SDK" >> "$GITHUB_ENV"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SM" --licenses > /dev/null || true
+          "$SM" "platform-tools" "build-tools;${ANDROID_BUILD_TOOLS}" "platforms;android-${ANDROID_PLATFORM}"
+
+      - name: Signing key and editor settings
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS_SECRET: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS_SECRET: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -eu
+          KS="$RUNNER_TEMP/release.keystore"
+          if [ -n "${KS_B64:-}" ]; then
+            echo "$KS_B64" | base64 -d > "$KS"
+            PASS="$KS_PASS_SECRET"
+            ALIAS="${KS_ALIAS_SECRET:-sunward}"
+          else
+            PASS="sunwardroads"
+            ALIAS="sunward"
+            keytool -genkeypair -keystore "$KS" -storepass "$PASS" -keypass "$PASS" -alias "$ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Sunward Roads, O=Sunward, C=US"
+          fi
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_PATH=$KS" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_USER=$ALIAS" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD=$PASS" >> "$GITHUB_ENV"
+          # Let Godot create its editor settings file, then append the Android paths to it.
+          godot --headless --quit || true
+          mkdir -p "$HOME/.config/godot"
+          if ! ls "$HOME"/.config/godot/editor_settings-*.tres > /dev/null 2>&1; then
+            printf '[gd_resource type="EditorSettings" format=3]\n\n[resource]\n' > "$HOME/.config/godot/editor_settings-4.7.tres"
+          fi
+          for f in "$HOME"/.config/godot/editor_settings-*.tres; do
+            {
+              echo "export/android/android_sdk_path = \"$ANDROID_SDK\""
+              echo "export/android/java_sdk_path = \"$JAVA_HOME\""
+              echo "export/android/debug_keystore = \"$KS\""
+              echo "export/android/debug_keystore_user = \"$ALIAS\""
+              echo "export/android/debug_keystore_pass = \"$PASS\""
+            } >> "$f"
+          done
+
+      - name: Import assets
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          godot --headless --path . --import || true
+          godot --headless --path . --import || true
+
+      - name: Export APK
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          mkdir -p build/android
+          godot --headless --path . --export-release "Android" "$PWD/build/android/SunwardRoads.apk"
+          ls -la build/android
+          test -s build/android/SunwardRoads.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SunwardRoads-apk
+          path: ${{ steps.proj.outputs.dir }}/build/android/SunwardRoads.apk
+          retention-days: 30
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: Sunward Roads APK #${{ github.run_number }}
+          body: Download SunwardRoads.apk and install it on an Android phone (allow installing from unknown sources). arm64 devices.
+          files: ${{ steps.proj.outputs.dir }}/build/android/SunwardRoads.apk
